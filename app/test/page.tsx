@@ -35,7 +35,7 @@ export default function TestPage() {
           className="rounded-lg bg-black px-4 py-2 text-white disabled:opacity-40">Desktop</button>
       </div>
       {loading && <p className="mt-4 text-gray-500">Running... 20-40 seconds</p>}
-      <pre className="mt-4 overflow-auto rounded-lg bg-gray-100 p-4 text-xs">{out}</pre>
+      <pre className="mt-4 overflow-auto rounded-lg bg-[#333] p-4 text-xs">{out}</pre>
     </main>
   );
 }
