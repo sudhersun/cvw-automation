@@ -1,5 +1,5 @@
 "use client";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { pickRun, pool, runFresh, type Mode, type PsiRun, type Strategy } from "@/lib/psi";
 import type { SheetRow } from "@/lib/mapping";
 
@@ -10,7 +10,7 @@ type RowState = {
   runs: PsiRun[];
   failed: number;
   picked: PsiRun | null;
-  status: "testing" | "written" | "error";
+  status: "testing" | "written" | "error" | "stopped";
   error?: string;
 };
 
@@ -25,6 +25,12 @@ const color = (r?: string | null) =>
 
 const SHEET_RE = /spreadsheets\/d\/[a-zA-Z0-9-_]+/;
 
+const save = (key: string, value: string) => {
+  try {
+    localStorage.setItem(key, value);
+  } catch { }
+};
+
 export default function Home() {
   const [link, setLink] = useState("");
   const [runCount, setRunCount] = useState(3);
@@ -35,8 +41,18 @@ export default function Home() {
   const [total, setTotal] = useState(0);
   const [message, setMessage] = useState("");
   const seenRef = useRef<Map<number, Set<string>>>(new Map());
+  const stopRef = useRef(false);
 
   const validLink = SHEET_RE.test(link);
+
+  // Load saved settings from this browser
+  useEffect(() => {
+    try {
+      setLink(localStorage.getItem("cwv.link") ?? "");
+      const n = Number(localStorage.getItem("cwv.runs"));
+      if (n >= 3 && n <= 5) setRunCount(n);
+    } catch { }
+  }, []);
 
   const post = (path: string, body: unknown) =>
     fetch(path, {
@@ -45,16 +61,18 @@ export default function Home() {
       body: JSON.stringify(body),
     });
 
-  const patch = (idx: number, p: Partial<RowState>) =>
-    setRows((prev) => prev.map((r, i) => (i === idx ? { ...r, ...p } : r)));
+  const patch = (rowNumber: number, p: Partial<RowState>) =>
+    setRows((prev) => prev.map((r) => (r.rowNumber === rowNumber ? { ...r, ...p } : r)));
 
-  async function start(m: Mode) {
+  // only = a set of row numbers to (re)test; leave empty to test every row
+  async function start(m: Mode, only?: Set<number>) {
+    stopRef.current = false;
     setMessage("");
-    setRows([]);
     setDone(0);
     setTotal(0);
     setMode(m);
     setBusy(true);
+    if (!only) setRows([]);
 
     try {
       // 1. Read the sheet
@@ -64,14 +82,16 @@ export default function Home() {
         setMessage(data.error ?? "Could not read the sheet.");
         return;
       }
-      const sheetRows = data.rows as SheetRow[];
-      if (!sheetRows.length) {
-        setMessage("No Mobile/Desktop rows found in the sheet.");
+      const allRows = data.rows as SheetRow[];
+      const targets = only ? allRows.filter((r) => only.has(r.rowNumber)) : allRows;
+      if (!targets.length) {
+        setMessage("No matching Mobile/Desktop rows found in the sheet.");
         return;
       }
 
-      // 2. Ask before overwriting existing values
+      // 2. Ask before overwriting (not needed when retrying rows)
       if (
+        !only &&
         data.filled?.[m] &&
         !window.confirm(`The ${m.toUpperCase()} columns already have values. Overwrite them?`)
       ) {
@@ -79,7 +99,7 @@ export default function Home() {
       }
 
       // 3. Set up the run
-      const initial: RowState[] = sheetRows.map((r) => ({
+      const fresh: RowState[] = targets.map((r) => ({
         rowNumber: r.rowNumber,
         url: r.url,
         device: r.device,
@@ -88,33 +108,39 @@ export default function Home() {
         picked: null,
         status: "testing",
       }));
-      setRows(initial);
+      setRows((prev) =>
+        only ? prev.map((r) => fresh.find((f) => f.rowNumber === r.rowNumber) ?? r) : fresh
+      );
       seenRef.current = new Map();
 
-      const finished: number[] = initial.map(() => 0);
-      const collected: PsiRun[][] = initial.map(() => []);
+      const finished: number[] = fresh.map(() => 0);
+      const collected: PsiRun[][] = fresh.map(() => []);
+      const lastError: string[] = fresh.map(() => "");
       let written = 0;
       let problems = 0;
 
       // Round 1 for every row, then round 2, ... (spreads each URL's runs apart)
-      const tasks = Array.from({ length: runCount }, () => initial.map((_, i) => i)).flat();
+      const tasks = Array.from({ length: runCount }, () => fresh.map((_, i) => i)).flat();
       setTotal(tasks.length);
 
       await pool(tasks, 4, async (idx) => {
-        const row = initial[idx];
+        if (stopRef.current) return;
+        const row = fresh[idx];
         let run: PsiRun | null = null;
         try {
           const seen = seenRef.current.get(idx) ?? new Set<string>();
           seenRef.current.set(idx, seen);
           run = await runFresh(row.url, row.device, seen);
-        } catch {}
+        } catch (e) {
+          lastError[idx] = e instanceof Error ? e.message : "Unknown error";
+        }
 
         if (run) collected[idx].push(run);
         finished[idx]++;
         setDone((d) => d + 1);
 
         const picked = pickRun(collected[idx], m);
-        patch(idx, {
+        patch(row.rowNumber, {
           runs: [...collected[idx]],
           failed: finished[idx] - collected[idx].length,
           picked,
@@ -125,7 +151,10 @@ export default function Home() {
         // All runs for this row are finished: write the picked run to the sheet
         if (!picked) {
           problems++;
-          patch(idx, { status: "error", error: "All runs failed" });
+          patch(row.rowNumber, {
+            status: "error",
+            error: `All runs failed: ${lastError[idx]}`,
+          });
           return;
         }
         try {
@@ -136,25 +165,71 @@ export default function Home() {
           });
           if (w.ok) {
             written++;
-            patch(idx, { status: "written" });
+            patch(row.rowNumber, { status: "written", error: undefined });
           } else {
             problems++;
-            patch(idx, { status: "error", error: (await w.json()).error ?? "Write failed" });
+            patch(row.rowNumber, {
+              status: "error",
+              error: (await w.json()).error ?? "Write failed",
+            });
           }
         } catch {
           problems++;
-          patch(idx, { status: "error", error: "Write failed" });
+          patch(row.rowNumber, { status: "error", error: "Write failed" });
         }
       });
 
-      setMessage(
-        `Finished. ${written} of ${initial.length} rows written to the sheet` +
+      if (stopRef.current) {
+        setRows((prev) =>
+          prev.map((r) =>
+            r.status === "testing" && fresh.some((f) => f.rowNumber === r.rowNumber)
+              ? { ...r, status: "stopped" }
+              : r
+          )
+        );
+        setMessage(`Stopped. ${written} rows were written before stopping.`);
+      } else {
+        setMessage(
+          `Finished. ${written} of ${fresh.length} rows written to the sheet` +
           (problems ? `, ${problems} need attention.` : ".")
-      );
+        );
+      }
     } finally {
       setBusy(false);
     }
   }
+
+  function downloadLog() {
+    const head = [
+      "mode", "row", "url", "device", "run", "score",
+      "fcp", "lcp", "cls", "si", "tbt", "tti", "tested_at_utc", "picked",
+    ];
+    const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const lines = [head.join(",")];
+    for (const r of rows) {
+      r.runs.forEach((run, i) => {
+        lines.push(
+          [
+            mode, r.rowNumber, r.url, r.device, i + 1, run.score,
+            run.fcp.display, run.lcp.display, run.cls.display,
+            run.si.display, run.tbt.display, run.tti.display,
+            run.testedAt, r.picked === run ? "yes" : "",
+          ]
+            .map(esc)
+            .join(",")
+        );
+      });
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `cwv-${mode ?? "run"}-log.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  const retryable = rows.filter((r) => r.status === "error" || r.status === "stopped");
+  const hasRuns = rows.some((r) => r.runs.length > 0);
 
   return (
     <main className="w-full px-4 py-8 md:px-[120px]">
@@ -165,7 +240,10 @@ export default function Home() {
 
       <input
         value={link}
-        onChange={(e) => setLink(e.target.value)}
+        onChange={(e) => {
+          setLink(e.target.value);
+          save("cwv.link", e.target.value);
+        }}
         placeholder="https://docs.google.com/spreadsheets/d/..."
         disabled={busy}
         className="mt-6 w-full rounded-lg border bg-transparent px-3 py-2"
@@ -179,7 +257,10 @@ export default function Home() {
           Runs per test:{" "}
           <select
             value={runCount}
-            onChange={(e) => setRunCount(Number(e.target.value))}
+            onChange={(e) => {
+              setRunCount(Number(e.target.value));
+              save("cwv.runs", e.target.value);
+            }}
             disabled={busy}
             className="rounded border bg-transparent px-2 py-1"
           >
@@ -204,6 +285,17 @@ export default function Home() {
         >
           Run After
         </button>
+        {busy && (
+          <button
+            onClick={() => {
+              stopRef.current = true;
+              setMessage("Stopping... waiting for running tests to finish.");
+            }}
+            className="rounded-lg border border-red-500 px-5 py-2 text-red-400"
+          >
+            Stop
+          </button>
+        )}
         {validLink && (
           <a href={link} target="_blank" rel="noreferrer" className="text-sm underline">
             Open sheet
@@ -229,6 +321,24 @@ export default function Home() {
       )}
       {message && <p className="mt-4 text-sm">{message}</p>}
 
+      {!busy && rows.length > 0 && (
+        <div className="mt-4 flex flex-wrap gap-3">
+          {retryable.length > 0 && mode && (
+            <button
+              onClick={() => start(mode, new Set(retryable.map((r) => r.rowNumber)))}
+              className="rounded-lg border px-4 py-2 text-sm"
+            >
+              Retry {retryable.length} failed/stopped row{retryable.length > 1 ? "s" : ""}
+            </button>
+          )}
+          {hasRuns && (
+            <button onClick={downloadLog} className="rounded-lg border px-4 py-2 text-sm">
+              Download run log (CSV)
+            </button>
+          )}
+        </div>
+      )}
+
       {rows.length > 0 && (
         <table className="mt-6 w-full text-left text-sm">
           <thead>
@@ -246,10 +356,10 @@ export default function Home() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, i) => {
+            {rows.map((r) => {
               const p = r.picked;
               return (
-                <tr key={i} className="border-b align-top">
+                <tr key={r.rowNumber} className="border-b align-top">
                   <td className="py-2">{r.rowNumber}</td>
                   <td className="max-w-[260px] truncate">{r.url}</td>
                   <td>{r.device}</td>
@@ -264,10 +374,19 @@ export default function Home() {
                   <td className={color(p?.cls.rating)}>{p?.cls.display ?? "-"}</td>
                   <td>
                     {r.status === "written" && <span className="text-green-400">Written</span>}
+                    {r.status === "testing" && <span className="text-gray-400">Testing...</span>}
+                    {r.status === "stopped" && <span className="text-gray-400">Stopped</span>}
                     {r.status === "error" && (
                       <span className="text-red-400">{r.error ?? "Error"}</span>
                     )}
-                    {r.status === "testing" && <span className="text-gray-400">Testing...</span>}
+                    {!busy && mode && (r.status === "error" || r.status === "stopped") && (
+                      <button
+                        onClick={() => start(mode, new Set([r.rowNumber]))}
+                        className="ml-2 underline"
+                      >
+                        Retry
+                      </button>
+                    )}
                   </td>
                 </tr>
               );

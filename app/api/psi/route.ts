@@ -42,10 +42,14 @@ export async function POST(req: NextRequest) {
     const data = await res.json();
 
     if (!res.ok) {
-      return NextResponse.json(
-        { error: data?.error?.message ?? "PageSpeed request failed" },
-        { status: res.status }
-      );
+      const raw: string = data?.error?.message ?? "";
+      const friendly =
+        res.status === 429
+          ? "PageSpeed rate limit reached. Wait a minute and retry."
+          : /FAILED_DOCUMENT_REQUEST|ERRORED_DOCUMENT_REQUEST|DNS_FAILURE/.test(raw)
+            ? "PageSpeed could not load this page (down, blocked, or not public)."
+            : raw || "PageSpeed request failed";
+      return NextResponse.json({ error: friendly }, { status: res.status });
     }
 
     const lh = data.lighthouseResult;
