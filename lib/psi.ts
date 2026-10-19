@@ -20,8 +20,8 @@ export type PsiRun = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// One test, retried up to 2 times if it fails
-export async function runOnce(url: string, strategy: Strategy, retries = 2): Promise<PsiRun> {
+// One test. If it fails, it re-runs automatically (up to 3 more tries, waiting longer each time)
+export async function runOnce(url: string, strategy: Strategy, retries = 3): Promise<PsiRun> {
   let lastErr = "Unknown error";
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -30,14 +30,21 @@ export async function runOnce(url: string, strategy: Strategy, retries = 2): Pro
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, strategy }),
       });
-      const json = await res.json();
-      if (res.ok) return json as PsiRun;
-      lastErr = json.error ?? `HTTP ${res.status}`;
+
+      // Read as text first: a platform timeout comes back as an HTML page, not JSON
+      const text = await res.text();
+      let json: { error?: string } & Partial<PsiRun> = {};
+      try {
+        json = JSON.parse(text);
+      } catch {}
+
+      if (res.ok && json.score !== undefined) return json as PsiRun;
+      lastErr = json.error ?? (res.status === 504 ? "Test timed out." : `HTTP ${res.status}`);
       if (res.status === 400) break; // bad input, retrying won't help
     } catch {
       lastErr = "Network error";
     }
-    await sleep(3000 * (attempt + 1)); // wait 3s, then 6s
+    await sleep([4000, 10000, 20000][attempt] ?? 20000);
   }
   throw new Error(lastErr);
 }

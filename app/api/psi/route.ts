@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Let this function run up to 60s (a PSI test takes 15-40s)
-export const maxDuration = 60;
+// Heavy pages can be slow. If Vercel rejects 90, use 60 here and 55_000 below.
+export const maxDuration = 90;
+const TEST_TIMEOUT_MS = 85_000;
 
 const AUDITS = {
   fcp: "first-contentful-paint",
@@ -11,6 +12,16 @@ const AUDITS = {
   tbt: "total-blocking-time",
   tti: "interactive",
 } as const;
+
+type Audit = { numericValue?: number; displayValue?: string; score?: number | null };
+type PsiResponse = {
+  error?: { message?: string };
+  analysisUTCTimestamp?: string;
+  lighthouseResult?: {
+    categories?: { performance?: { score?: number | null } };
+    audits?: Record<string, Audit>;
+  };
+};
 
 // Same bands PSI uses: 0.9+ green, 0.5-0.89 orange, below 0.5 red
 function rating(score: number | null | undefined) {
@@ -37,26 +48,33 @@ export async function POST(req: NextRequest) {
   try {
     const res = await fetch(api, {
       cache: "no-store",
-      signal: AbortSignal.timeout(55000),
+      signal: AbortSignal.timeout(TEST_TIMEOUT_MS),
     });
-    const data = await res.json();
 
-    if (!res.ok) {
-      const raw: string = data?.error?.message ?? "";
+    // Read as text first, so an HTML error page can't crash the JSON parsing
+    const text = await res.text();
+    let data: PsiResponse | null = null;
+    try {
+      data = JSON.parse(text) as PsiResponse;
+    } catch {}
+
+    const lh = data?.lighthouseResult;
+
+    if (!res.ok || !data || !lh) {
+      const raw = data?.error?.message ?? "";
       const friendly =
         res.status === 429
           ? "PageSpeed rate limit reached. Wait a minute and retry."
           : /FAILED_DOCUMENT_REQUEST|ERRORED_DOCUMENT_REQUEST|DNS_FAILURE/.test(raw)
-            ? "PageSpeed could not load this page (down, blocked, or not public)."
-            : raw || "PageSpeed request failed";
-      return NextResponse.json({ error: friendly }, { status: res.status });
+          ? "PageSpeed could not load this page (down, blocked, or not public)."
+          : raw || "PageSpeed returned an unexpected response. Try again.";
+      return NextResponse.json({ error: friendly }, { status: res.ok ? 502 : res.status });
     }
 
-    const lh = data.lighthouseResult;
-    const perf = lh?.categories?.performance?.score; // 0 to 1
+    const perf = lh.categories?.performance?.score; // 0 to 1
 
     const metric = (id: string) => {
-      const a = lh?.audits?.[id];
+      const a = lh.audits?.[id];
       return {
         value: a?.numericValue ?? null, // ms (CLS has no unit)
         display: a?.displayValue ?? null, // e.g. "1.2 s"
@@ -81,9 +99,14 @@ export async function POST(req: NextRequest) {
       testedAt: data.analysisUTCTimestamp ?? null,
     });
   } catch (e) {
+    const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
     return NextResponse.json(
-      { error: "Test timed out or failed. Try again." },
-      { status: 504 }
+      {
+        error: timedOut
+          ? "PageSpeed took too long on this page. Try again."
+          : "Could not reach PageSpeed. Try again.",
+      },
+      { status: timedOut ? 504 : 502 }
     );
   }
 }

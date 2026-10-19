@@ -2,15 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 import type { sheets_v4 } from "googleapis";
 import { getSheets, parseSheetUrl } from "@/lib/sheets";
 import { mapHeaders, type Phase } from "@/lib/mapping";
+import { makeReportLink } from "@/lib/report";
 import type { PsiRun } from "@/lib/psi";
 
-// "fill" colours the cell background, "text" colours the number itself
 // Font colours, the same ones PSI uses for its numbers
 const TEXT = { green: "#018642", orange: "#E67700", red: "#C7221F" };
 
 const WRITE_KEYS = ["score", "fcp", "lcp", "cls", "si", "tbt", "tti"] as const;
 
 type Rating = PsiRun["scoreRating"];
+type Item = { rowNumber: number; run: PsiRun };
+type Group = { mobile?: Item; desktop?: Item };
 
 function rgb(hex: string) {
   const n = parseInt(hex.slice(1), 16);
@@ -43,9 +45,7 @@ function valueCell(
             {
               userEnteredValue: value,
               userEnteredFormat: {
-                textFormat: {
-                  foregroundColor: rgb(rating ? TEXT[rating] : "#000000"),
-                },
+                textFormat: { foregroundColor: rgb(rating ? TEXT[rating] : "#000000") },
               },
             },
           ],
@@ -57,7 +57,13 @@ function valueCell(
   };
 }
 
-function linkCell(sheetId: number, row: number, col: number, url: string): sheets_v4.Schema$Request {
+function linkCell(
+  sheetId: number,
+  row: number,
+  col: number,
+  url: string,
+  label: string
+): sheets_v4.Schema$Request {
   return {
     updateCells: {
       range: range(sheetId, row, col),
@@ -65,7 +71,7 @@ function linkCell(sheetId: number, row: number, col: number, url: string): sheet
         {
           values: [
             {
-              userEnteredValue: { stringValue: url },
+              userEnteredValue: { stringValue: label },
               userEnteredFormat: {
                 textFormat: { link: { uri: url }, underline: true, foregroundColor: rgb("#1155CC") },
               },
@@ -79,15 +85,21 @@ function linkCell(sheetId: number, row: number, col: number, url: string): sheet
 }
 
 export async function POST(req: NextRequest) {
-  const { sheetUrl, mode, results } = (await req.json()) as {
+  const { sheetUrl, mode, groups } = (await req.json()) as {
     sheetUrl: string;
     mode: Phase;
-    results: { rowNumber: number; run: PsiRun }[];
+    groups: Group[];
   };
   const { id, gid } = parseSheetUrl(sheetUrl ?? "");
-  if (!id || (mode !== "before" && mode !== "after") || !Array.isArray(results)) {
+  if (!id || (mode !== "before" && mode !== "after") || !Array.isArray(groups)) {
     return NextResponse.json({ error: "Bad request." }, { status: 400 });
   }
+  if (!process.env.REPORT_SECRET) {
+    return NextResponse.json({ error: "REPORT_SECRET is not set on the server." }, { status: 500 });
+  }
+
+  // Links point to whichever site is running this (run client jobs from the live site)
+  const origin = req.nextUrl.origin;
 
   try {
     const sheets = getSheets();
@@ -110,35 +122,48 @@ export async function POST(req: NextRequest) {
     const linkCol = mapping.link[mode];
 
     const requests: sheets_v4.Schema$Request[] = [];
-    for (const { rowNumber, run } of results) {
-      const r = rowNumber - 1;
-      for (const key of WRITE_KEYS) {
-        const col = cols[key];
-        if (col === undefined) continue;
 
-        let value: string | number | null;
-        let rating: Rating;
-        if (key === "score") {
-          value = run.score;
-          rating = run.scoreRating;
-        } else {
-          value = run[key].display;
-          rating = run[key].rating;
+    for (const g of groups) {
+      const runs = { mobile: g.mobile?.run, desktop: g.desktop?.run };
+
+      for (const device of ["mobile", "desktop"] as const) {
+        const item = g[device];
+        if (!item) continue;
+        const r = item.rowNumber - 1;
+        const run = item.run;
+
+        for (const key of WRITE_KEYS) {
+          const col = cols[key];
+          if (col === undefined) continue;
+
+          let value: string | number | null;
+          let rating: Rating;
+          if (key === "score") {
+            value = run.score;
+            rating = run.scoreRating;
+          } else {
+            value = run[key].display;
+            rating = run[key].rating;
+          }
+          if (value === null || value === undefined) continue;
+
+          requests.push(
+            valueCell(
+              tabId,
+              r,
+              col,
+              typeof value === "number" ? { numberValue: value } : { stringValue: value },
+              rating
+            )
+          );
         }
-        if (value === null || value === undefined) continue;
 
-        requests.push(
-          valueCell(
-            tabId,
-            r,
-            col,
-            typeof value === "number" ? { numberValue: value } : { stringValue: value },
-            rating
-          )
-        );
-      }
-      if (linkCol !== null && run.reportLink) {
-        requests.push(linkCell(tabId, r, linkCol, run.reportLink));
+        // Same link in both rows; it opens on this row's own tab
+        if (linkCol !== null) {
+          requests.push(
+            linkCell(tabId, r, linkCol, makeReportLink(origin, mode, runs, device), "View report")
+          );
+        }
       }
     }
 

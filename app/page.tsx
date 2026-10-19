@@ -7,12 +7,15 @@ type RowState = {
   rowNumber: number;
   url: string;
   device: Strategy;
+  group: number;
   runs: PsiRun[];
   failed: number;
   picked: PsiRun | null;
-  status: "testing" | "written" | "error" | "stopped";
+  status: "testing" | "tested" | "written" | "error" | "stopped";
   error?: string;
 };
+
+type Item = { rowNumber: number; run: PsiRun };
 
 const COLOR = {
   green: "text-green-400",
@@ -28,7 +31,7 @@ const SHEET_RE = /spreadsheets\/d\/[a-zA-Z0-9-_]+/;
 const save = (key: string, value: string) => {
   try {
     localStorage.setItem(key, value);
-  } catch { }
+  } catch {}
 };
 
 export default function Home() {
@@ -51,7 +54,7 @@ export default function Home() {
       setLink(localStorage.getItem("cwv.link") ?? "");
       const n = Number(localStorage.getItem("cwv.runs"));
       if (n >= 3 && n <= 5) setRunCount(n);
-    } catch { }
+    } catch {}
   }, []);
 
   const post = (path: string, body: unknown) =>
@@ -72,6 +75,7 @@ export default function Home() {
     setTotal(0);
     setMode(m);
     setBusy(true);
+    const previous = rows; // earlier results, reused for the partner device on retries
     if (!only) setRows([]);
 
     try {
@@ -103,6 +107,7 @@ export default function Home() {
         rowNumber: r.rowNumber,
         url: r.url,
         device: r.device,
+        group: r.group,
         runs: [],
         failed: 0,
         picked: null,
@@ -113,11 +118,65 @@ export default function Home() {
       );
       seenRef.current = new Map();
 
+      // Results from an earlier run for rows we are not retesting now
+      const earlier = new Map<number, PsiRun>();
+      if (only) {
+        previous.forEach((r) => {
+          if (r.status === "written" && r.picked) earlier.set(r.rowNumber, r.picked);
+        });
+      }
+
       const finished: number[] = fresh.map(() => 0);
       const collected: PsiRun[][] = fresh.map(() => []);
       const lastError: string[] = fresh.map(() => "");
       let written = 0;
       let problems = 0;
+
+      // How many rows of each URL block are still being tested
+      const groupLeft = new Map<number, number>();
+      fresh.forEach((r) => groupLeft.set(r.group, (groupLeft.get(r.group) ?? 0) + 1));
+
+      // Saves a URL's Mobile + Desktop results together, so they share one report link
+      async function saveGroup(group: number) {
+        const items: Partial<Record<Strategy, Item>> = {};
+        const saving: number[] = [];
+
+        fresh.forEach((row, i) => {
+          if (row.group !== group) return;
+          const picked = pickRun(collected[i], m);
+          if (!picked) {
+            problems++;
+            patch(row.rowNumber, { status: "error", error: `All runs failed: ${lastError[i]}` });
+            return;
+          }
+          items[row.device] = { rowNumber: row.rowNumber, run: picked };
+          saving.push(row.rowNumber);
+        });
+
+        // The other device of this URL, if it was saved earlier and isn't being retested
+        for (const r of allRows) {
+          if (r.group === group && !items[r.device]) {
+            const prev = earlier.get(r.rowNumber);
+            if (prev) items[r.device] = { rowNumber: r.rowNumber, run: prev };
+          }
+        }
+        if (!saving.length) return;
+
+        try {
+          const w = await post("/api/sheet/write", { sheetUrl: link, mode: m, groups: [items] });
+          if (w.ok) {
+            written += saving.length;
+            saving.forEach((n) => patch(n, { status: "written", error: undefined }));
+          } else {
+            const msg = (await w.json()).error ?? "Write failed";
+            problems += saving.length;
+            saving.forEach((n) => patch(n, { status: "error", error: msg }));
+          }
+        } catch {
+          problems += saving.length;
+          saving.forEach((n) => patch(n, { status: "error", error: "Write failed" }));
+        }
+      }
 
       // Round 1 for every row, then round 2, ... (spreads each URL's runs apart)
       const tasks = Array.from({ length: runCount }, () => fresh.map((_, i) => i)).flat();
@@ -147,42 +206,19 @@ export default function Home() {
         });
 
         if (finished[idx] < runCount) return;
+        if (picked) patch(row.rowNumber, { status: "tested" });
 
-        // All runs for this row are finished: write the picked run to the sheet
-        if (!picked) {
-          problems++;
-          patch(row.rowNumber, {
-            status: "error",
-            error: `All runs failed: ${lastError[idx]}`,
-          });
-          return;
-        }
-        try {
-          const w = await post("/api/sheet/write", {
-            sheetUrl: link,
-            mode: m,
-            results: [{ rowNumber: row.rowNumber, run: picked }],
-          });
-          if (w.ok) {
-            written++;
-            patch(row.rowNumber, { status: "written", error: undefined });
-          } else {
-            problems++;
-            patch(row.rowNumber, {
-              status: "error",
-              error: (await w.json()).error ?? "Write failed",
-            });
-          }
-        } catch {
-          problems++;
-          patch(row.rowNumber, { status: "error", error: "Write failed" });
-        }
+        // When every row of this URL has finished, save them together
+        const left = (groupLeft.get(row.group) ?? 1) - 1;
+        groupLeft.set(row.group, left);
+        if (left === 0) await saveGroup(row.group);
       });
 
       if (stopRef.current) {
         setRows((prev) =>
           prev.map((r) =>
-            r.status === "testing" && fresh.some((f) => f.rowNumber === r.rowNumber)
+            (r.status === "testing" || r.status === "tested") &&
+            fresh.some((f) => f.rowNumber === r.rowNumber)
               ? { ...r, status: "stopped" }
               : r
           )
@@ -191,7 +227,7 @@ export default function Home() {
       } else {
         setMessage(
           `Finished. ${written} of ${fresh.length} rows written to the sheet` +
-          (problems ? `, ${problems} need attention.` : ".")
+            (problems ? `, ${problems} need attention.` : ".")
         );
       }
     } finally {
@@ -375,6 +411,9 @@ export default function Home() {
                   <td>
                     {r.status === "written" && <span className="text-green-400">Written</span>}
                     {r.status === "testing" && <span className="text-gray-400">Testing...</span>}
+                    {r.status === "tested" && (
+                      <span className="text-gray-400">Tested, waiting to save</span>
+                    )}
                     {r.status === "stopped" && <span className="text-gray-400">Stopped</span>}
                     {r.status === "error" && (
                       <span className="text-red-400">{r.error ?? "Error"}</span>

@@ -9,7 +9,12 @@ export type Mapping = {
   screenshot: Record<Phase, number | null>;
 };
 
-export type SheetRow = { rowNumber: number; url: string; device: "mobile" | "desktop" };
+export type SheetRow = {
+  rowNumber: number;
+  url: string;
+  device: "mobile" | "desktop";
+  group: number; // rows with the same group belong to the same URL block
+};
 
 // Header names we recognise (lowercase). Add more here if a client uses other names.
 const METRIC_NAMES: Record<string, MetricKey> = {
@@ -81,13 +86,17 @@ export function parseRows(values: string[][], m: Mapping): SheetRow[] {
   if (m.urlCol === null || m.deviceCol === null) return [];
   const out: SheetRow[] = [];
   let currentUrl = "";
+  let group = -1;
   for (let r = 1; r < values.length; r++) {
     const row = values[r] ?? [];
     const url = String(row[m.urlCol] ?? "").trim();
-    if (url) currentUrl = url;
+    if (url) {
+      currentUrl = url;
+      group++;
+    }
     const device = String(row[m.deviceCol] ?? "").trim().toLowerCase();
     if ((device === "mobile" || device === "desktop") && currentUrl) {
-      out.push({ rowNumber: r + 1, url: currentUrl, device });
+      out.push({ rowNumber: r + 1, url: currentUrl, device, group });
     }
   }
   return out;
